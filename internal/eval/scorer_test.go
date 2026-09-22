@@ -65,3 +65,43 @@ func TestEvaluate(t *testing.T) {
 		t.Errorf("Expected no regression alert for high score")
 	}
 }
+
+// Regression test: map iteration used to make "gpt-4o-mini" randomly match the
+// more expensive "gpt-4o" rate card.
+func TestCalculateCostPrefersMostSpecificRateCard(t *testing.T) {
+	want := CalculateCost("gpt-4o-mini", 1_000_000, 0)
+	if want != ModelPricing["gpt-4o-mini"].InputPerMillion {
+		t.Fatalf("gpt-4o-mini input cost = %f, want %f", want, ModelPricing["gpt-4o-mini"].InputPerMillion)
+	}
+	for i := 0; i < 200; i++ {
+		if got := CalculateCost("gpt-4o-mini", 1_000_000, 0); got != want {
+			t.Fatalf("non-deterministic cost on iteration %d: got %f want %f", i, got, want)
+		}
+	}
+	if got := LookupRateCard("gemini-1.5-pro"); got != ModelPricing["gemini-1.5-pro"] {
+		t.Errorf("gemini-1.5-pro matched %+v, want pro rate card", got)
+	}
+}
+
+func TestCalculateCostClampsNegativeTokens(t *testing.T) {
+	if got := CalculateCost("gpt-4o", -100, -100); got != 0 {
+		t.Errorf("expected 0 for negative token counts, got %f", got)
+	}
+}
+
+func TestEvaluateWithoutGroundTruthIsUngraded(t *testing.T) {
+	sc := Evaluate("some exploratory answer", "", "gpt-4o", DefaultBaselineScore, DefaultDriftThresholdPercent)
+	if sc.Graded {
+		t.Error("expected ungraded score card without ground truth")
+	}
+	if sc.RegressionAlert || sc.DriftPercent != 0 {
+		t.Errorf("ungraded runs must not raise regressions, got alert=%v drift=%v", sc.RegressionAlert, sc.DriftPercent)
+	}
+}
+
+func TestEvaluateFlagsRegressionForPoorMatch(t *testing.T) {
+	sc := Evaluate("completely unrelated text", "package main worker pool", "gpt-4o", DefaultBaselineScore, DefaultDriftThresholdPercent)
+	if !sc.Graded || !sc.RegressionAlert {
+		t.Errorf("expected graded regression alert, got %+v", sc)
+	}
+}

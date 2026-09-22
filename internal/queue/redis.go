@@ -44,14 +44,21 @@ func (q *Queue) Ping(ctx context.Context) error {
 	return q.client.Ping(ctx).Err()
 }
 
+// Client exposes the underlying Redis client so other components (e.g. the job
+// store) can share its connection pool.
+func (q *Queue) Client() *redis.Client {
+	return q.client
+}
+
 // Close gracefully closes the Redis client.
 func (q *Queue) Close() error {
 	return q.client.Close()
 }
 
 // EnsureConsumerGroup creates the consumer group if it does not already exist.
+// The group starts at "0" so jobs enqueued before the group existed are not lost.
 func (q *Queue) EnsureConsumerGroup(ctx context.Context, stream, group string) error {
-	err := q.client.XGroupCreateMkStream(ctx, stream, group, "$").Err()
+	err := q.client.XGroupCreateMkStream(ctx, stream, group, "0").Err()
 	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 		return fmt.Errorf("failed to create consumer group %s on %s: %w", group, stream, err)
 	}
@@ -115,6 +122,13 @@ func (q *Queue) AckJob(ctx context.Context, stream, group string, messageIDs ...
 	return q.client.XAck(ctx, stream, group, messageIDs...).Err()
 }
 
+// DeleteMessage removes a processed message from the stream. Payloads carry
+// ephemeral BYOK credentials, so they are dropped as soon as they are handled
+// rather than lingering until MAXLEN trimming.
+func (q *Queue) DeleteMessage(ctx context.Context, stream string, messageIDs ...string) error {
+	return q.client.XDel(ctx, stream, messageIDs...).Err()
+}
+
 // AutoclaimAbandoned retrieves tasks from dead or crashed workers idle longer than minIdle.
 func (q *Queue) AutoclaimAbandoned(ctx context.Context, stream, group, consumer string, minIdle time.Duration) ([]redis.XMessage, error) {
 	msgs, _, err := q.client.XAutoClaim(ctx, &redis.XAutoClaimArgs{
@@ -129,16 +143,39 @@ func (q *Queue) AutoclaimAbandoned(ctx context.Context, stream, group, consumer 
 }
 
 // SendToDLQ forwards an unprocessable message to the dead-letter stream.
+// The raw payload is never copied: it may contain API keys. Only the job ID
+// and a redacted payload (keys stripped) are retained for diagnosis.
 func (q *Queue) SendToDLQ(ctx context.Context, dlqStream string, msg redis.XMessage, reason string) error {
+	jobID, _ := msg.Values["job_id"].(string)
 	return q.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: dlqStream,
 		MaxLen: 10000,
 		Approx: true,
 		Values: map[string]interface{}{
-			"original_id":    msg.ID,
-			"original_values": fmt.Sprintf("%v", msg.Values),
-			"failure_reason": reason,
-			"failed_at":      time.Now().UTC().Format(time.RFC3339),
+			"original_id":      msg.ID,
+			"job_id":           jobID,
+			"redacted_payload": RedactPayload(msg.Values["payload"]),
+			"failure_reason":   reason,
+			"failed_at":        time.Now().UTC().Format(time.RFC3339),
 		},
 	}).Err()
+}
+
+// RedactPayload returns the JSON payload with credentials removed. Payloads that
+// cannot be parsed are dropped entirely rather than risk leaking secrets.
+func RedactPayload(raw interface{}) string {
+	s, ok := raw.(string)
+	if !ok {
+		return ""
+	}
+	var job EvalJobPayload
+	if err := json.Unmarshal([]byte(s), &job); err != nil {
+		return "[unparseable payload omitted]"
+	}
+	job.ApiKeys = nil
+	out, err := json.Marshal(job)
+	if err != nil {
+		return ""
+	}
+	return string(out)
 }

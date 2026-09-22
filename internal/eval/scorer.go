@@ -2,9 +2,16 @@ package eval
 
 import (
 	"math"
+	"sort"
 	"strings"
 	"unicode"
 )
+
+// DefaultBaselineScore is the reference semantic score that drift is measured against.
+const DefaultBaselineScore = 0.92
+
+// DefaultDriftThresholdPercent is the drift beyond which a result raises a regression alert.
+const DefaultDriftThresholdPercent = 5.0
 
 // RateCard defines input and output cost per 1,000,000 tokens in USD.
 type RateCard struct {
@@ -38,23 +45,53 @@ var ModelPricing = map[string]RateCard{
 // ScoreCard holds the multi-dimensional evaluation results for a model's output.
 type ScoreCard struct {
 	ExactMatch      bool    `json:"exact_match"`
+	Graded          bool    `json:"graded"`
 	SemanticScore   float64 `json:"semantic_score"`
 	CostUSD         float64 `json:"cost_usd"`
 	RegressionAlert bool    `json:"regression_alert"`
 	DriftPercent    float64 `json:"drift_percent"`
 }
 
-// CalculateCost computes the dollar cost of an evaluation using Cline-style token pricing.
-func CalculateCost(modelName string, promptTokens, completionTokens int) float64 {
-	lower := strings.ToLower(modelName)
-	var card RateCard = RateCard{InputPerMillion: 1.00, OutputPerMillion: 3.00} // Default fallback
+// defaultRateCard applies to models without a known rate card.
+var defaultRateCard = RateCard{InputPerMillion: 1.00, OutputPerMillion: 3.00}
 
-	for key, rate := range ModelPricing {
+// pricingKeys lists ModelPricing keys longest-first so the most specific entry
+// wins (e.g. "gpt-4o-mini" must not be billed as "gpt-4o"). Iterating the map
+// directly would pick a random match on every call.
+var pricingKeys = func() []string {
+	keys := make([]string, 0, len(ModelPricing))
+	for k := range ModelPricing {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
+}()
+
+// LookupRateCard returns the most specific rate card matching a model identifier.
+func LookupRateCard(modelName string) RateCard {
+	lower := strings.ToLower(modelName)
+	for _, key := range pricingKeys {
 		if strings.Contains(lower, key) {
-			card = rate
-			break
+			return ModelPricing[key]
 		}
 	}
+	return defaultRateCard
+}
+
+// CalculateCost computes the dollar cost of an evaluation using Cline-style token pricing.
+func CalculateCost(modelName string, promptTokens, completionTokens int) float64 {
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	if completionTokens < 0 {
+		completionTokens = 0
+	}
+	card := LookupRateCard(modelName)
 
 	inputCost := (float64(promptTokens) / 1_000_000.0) * card.InputPerMillion
 	outputCost := (float64(completionTokens) / 1_000_000.0) * card.OutputPerMillion
@@ -62,6 +99,8 @@ func CalculateCost(modelName string, promptTokens, completionTokens int) float64
 }
 
 // Evaluate performs multi-metric evaluation comparing model response with ground truth.
+// Without a ground truth there is no reference to regress against, so the result
+// is marked ungraded and never raises a regression alert.
 func Evaluate(response, groundTruth, modelName string, baselineScore, thresholdPercent float64) ScoreCard {
 	normResp := normalizeText(response)
 	normTruth := normalizeText(groundTruth)
@@ -79,10 +118,10 @@ func Evaluate(response, groundTruth, modelName string, baselineScore, thresholdP
 		semanticScore = math.Min(1.0, 0.70+float64(len(strings.Fields(response)))*0.002)
 	}
 
-	// 3. Regression Detection
+	// 3. Regression Detection (graded runs only)
 	var isRegressed bool
 	var driftPercent float64
-	if baselineScore > 0 {
+	if normTruth != "" && baselineScore > 0 {
 		driftPercent = ((baselineScore - semanticScore) / baselineScore) * 100.0
 		if driftPercent > thresholdPercent {
 			isRegressed = true
@@ -91,6 +130,7 @@ func Evaluate(response, groundTruth, modelName string, baselineScore, thresholdP
 
 	return ScoreCard{
 		ExactMatch:      exactMatch,
+		Graded:          normTruth != "",
 		SemanticScore:   math.Round(semanticScore*1000) / 1000,
 		RegressionAlert: isRegressed,
 		DriftPercent:    math.Round(driftPercent*10) / 10,
