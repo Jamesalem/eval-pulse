@@ -5,41 +5,51 @@ info:
     Distributed Multi-Model LLM Evaluation & Regression Pipeline REST API.
     Provides endpoints for asynchronous benchmark dispatch, real-time metrics inspection,
     Cline-style Bring-Your-Own-Account (BYOK) credential testing, and CI/CD regression gates.
-  version: 1.0.0
+
+
+    Models without a configured API key run against an offline simulated provider.
+    Simulated results are flagged with `simulated: true` and are never graded, so they
+    cannot trip the regression gate. Only results produced by a real provider for a job
+    that includes a `ground_truth` are graded.
+  version: 1.1.0
   contact:
     name: EvalPulse Engineering Team
     url: https://github.com/evalpulse/eval-pulse
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
 servers:
   - url: http://localhost:8080
     description: Local Docker / Development Server
+
+# The API has no authentication of its own; it is intended to run on a trusted
+# network. Provider credentials travel in the request body (`api_keys`), not headers.
+security: []
 
 paths:
   /healthz:
     get:
       summary: Liveness and Readiness Probe
+      description: >
+        Always returns 200 while the process is serving. When the API was started with
+        Redis, Redis is pinged live on every call; an unreachable Redis reports
+        `status: degraded`.
       operationId: getHealth
       responses:
         '200':
-          description: Service is healthy and Redis connection is verified
+          description: Service status
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: ok
-                  redis:
-                    type: string
-                    example: connected
-                  version:
-                    type: string
-                    example: 1.0.0
+                $ref: '#/components/schemas/HealthResponse'
 
   /api/v1/providers/validate:
     post:
       summary: Validate Cline-style BYOK Provider Credentials
-      description: Tests direct connectivity and quota availability for a specified model provider using the user's API key.
+      description: >
+        Tests connectivity to a provider using the supplied API key (or, for Ollama, the
+        endpoint URL) by issuing a minimal request. Rejected keys (any non-2xx upstream
+        response) fail validation.
       operationId: validateProvider
       requestBody:
         required: true
@@ -49,35 +59,44 @@ paths:
               $ref: '#/components/schemas/ProviderValidationRequest'
       responses:
         '200':
-          description: Credentials valid and quota verified
+          description: Credentials verified
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  provider:
-                    type: string
-                    example: gemini
-                  valid:
-                    type: boolean
-                    example: true
-                  latency_ms:
-                    type: integer
-                    example: 124
-                  message:
-                    type: string
-                    example: Provider connection and model quota validated successfully.
+                $ref: '#/components/schemas/ProviderValidationResult'
         '400':
-          description: Invalid key or authentication failure
+          description: >
+            Either the request was invalid (malformed JSON, unsupported provider, or a
+            non-http(s) endpoint), in which case an `ErrorResponse` is returned, or the
+            credential check failed, in which case a `ProviderValidationResult` with
+            `valid: false` is returned.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                oneOf:
+                  - $ref: '#/components/schemas/ProviderValidationResult'
+                  - $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                rejectedKey:
+                  summary: Credential check failed
+                  value:
+                    provider: openai
+                    valid: false
+                    latency_ms: 212
+                    message: 'Credential check failed: openai returned HTTP 401: {"error":{"message":"Incorrect API key provided"}}'
+                unsupportedProvider:
+                  summary: Unsupported provider
+                  value:
+                    error: Unsupported provider "openrouter"
 
   /api/v1/eval/jobs:
     post:
       summary: Submit Asynchronous Multi-Model Evaluation Job
-      description: Enqueues a benchmark suite or prompt task onto the Redis Stream for distributed worker processing.
+      description: >
+        Validates the request, enforces the budget cap against the worst-case cost (every
+        target model producing `max_tokens` of output), records the job as `queued`, and
+        enqueues it onto the Redis Stream. When Redis is unavailable the job runs
+        in-process on the API (`execution_mode: local`).
       operationId: submitEvalJob
       requestBody:
         required: true
@@ -87,37 +106,48 @@ paths:
               $ref: '#/components/schemas/JobSubmissionRequest'
       responses:
         '202':
-          description: Job accepted and queued for worker execution
+          description: Job accepted
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/JobAcceptedResponse'
         '400':
-          description: Invalid request schema
+          description: >
+            Invalid request: malformed or oversized body (limit 1 MiB), missing prompt,
+            out-of-range `max_tokens` or `budget_cap_usd`, too many target models, invalid
+            Ollama endpoint, or a worst-case cost that exceeds `budget_cap_usd`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '402':
-          description: Estimated token cost exceeds user budget hard-cap
+              examples:
+                budgetExceeded:
+                  summary: Worst-case cost exceeds the budget cap
+                  value:
+                    error: Worst-case cost $0.1200 exceeds the budget cap of $0.01. Reduce max tokens or target models, or raise the cap.
+                missingPrompt:
+                  summary: Missing prompt
+                  value:
+                    error: Field 'prompt' is required
+        '503':
+          description: Redis is unavailable and the bounded local executor is saturated. Retry shortly.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
     get:
       summary: List Recent Evaluation Jobs
+      description: Returns the most recent jobs, newest first, including per-model results.
       operationId: listEvalJobs
       parameters:
         - name: limit
           in: query
+          description: Number of jobs to return. Values above 100 are clamped to 100.
           schema:
             type: integer
+            minimum: 1
+            maximum: 100
             default: 20
-        - name: status
-          in: query
-          schema:
-            type: string
-            enum: [queued, running, completed, failed]
       responses:
         '200':
           description: Array of recent evaluation jobs
@@ -126,7 +156,19 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/EvalJobSummary'
+                  $ref: '#/components/schemas/EvalJob'
+        '400':
+          description: '`limit` is not a positive integer'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Storage failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/eval/jobs/{id}:
     get:
@@ -136,18 +178,31 @@ paths:
         - name: id
           in: path
           required: true
+          description: Job ID (a UUID for submitted jobs; demo seed jobs use IDs such as `job-seed-01`).
           schema:
             type: string
-            format: uuid
+            maxLength: 64
       responses:
         '200':
-          description: Detailed evaluation results across all models
+          description: Job with per-model results
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EvalJobDetail'
+                $ref: '#/components/schemas/EvalJob'
+        '400':
+          description: Invalid job ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Storage failure
           content:
             application/json:
               schema:
@@ -156,45 +211,102 @@ paths:
   /api/v1/metrics/comparison:
     get:
       summary: Get Cross-Model Comparison Matrix
-      description: Returns aggregated latency percentiles, average semantic score, total token count, and spend across models.
+      description: >
+        Aggregates the most recent 500 jobs per model. Failed calls are counted in
+        `total_evals` and `failed_evals` but excluded from latency percentiles, scores and
+        spend. `regression_status` is derived from graded results only.
       operationId: getModelComparison
       responses:
         '200':
-          description: Comparison scorecard across configured providers
+          description: Comparison scorecard per model, sorted by model name
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/ModelComparisonMetric'
+        '500':
+          description: Storage failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/metrics/regression-check:
     get:
       summary: CI/CD Continuous Regression Quality Gate
-      description: Evaluates whether any candidate model has dropped below the baseline threshold (>5% semantic regression). Returns exit status.
+      description: >
+        For every model with graded results, drift is
+        `(baseline_score - avg_graded_score) / baseline_score * 100`. The gate fails when any
+        model's drift exceeds `threshold_percent`. Models with no graded results are ignored;
+        with no graded models at all the gate passes and `graded_models` is 0.
       operationId: checkRegressionGate
       parameters:
         - name: threshold_percent
           in: query
           schema:
             type: number
+            exclusiveMinimum: true
+            minimum: 0
+            maximum: 100
             default: 5.0
       responses:
         '200':
-          description: Regression check passed (all models meet baseline)
+          description: Regression check passed
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/RegressionCheckResult'
+        '400':
+          description: '`threshold_percent` is not a number in (0, 100]'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Regression detected (one or more models failed threshold)
+          description: Regression detected (one or more models exceeded the threshold)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/RegressionCheckResult'
+              example:
+                passed: false
+                exit_code: 1
+                threshold_percent: 5.0
+                baseline_score: 0.92
+                graded_models: 3
+                max_observed_drift_percent: 12.4
+                failing_models: [gpt-4o-mini]
+                message: Regression detected in 1 model(s) exceeding the 5.0% drift threshold.
+                timestamp: '2026-09-22T14:39:04Z'
+        '500':
+          description: Storage failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
 components:
   schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          example: ok
+        redis:
+          type: string
+          enum: [connected, unreachable, standalone_in_memory]
+          description: '`standalone_in_memory` means the API started without Redis and executes jobs in-process.'
+          example: connected
+        timestamp:
+          type: string
+          format: date-time
+        version:
+          type: string
+          example: 1.1.0
+
     ProviderValidationRequest:
       type: object
       required:
@@ -202,41 +314,87 @@ components:
       properties:
         provider:
           type: string
-          enum: [gemini, openai, anthropic, ollama, openrouter]
+          description: Provider family, or a model ID belonging to one (e.g. `gpt-4o-mini`).
+          enum: [gemini, openai, anthropic, ollama]
           example: gemini
         api_key:
           type: string
+          description: Required for every provider except Ollama.
           example: AIzaSy...
         endpoint_url:
           type: string
+          format: uri
+          description: Absolute http(s) URL. Overrides the provider's default endpoint; for Ollama, the daemon base URL.
           example: http://localhost:11434
+
+    ProviderValidationResult:
+      type: object
+      properties:
+        provider:
+          type: string
+          example: gemini
+        valid:
+          type: boolean
+          example: true
+        latency_ms:
+          type: integer
+          example: 124
+        message:
+          type: string
+          example: Credentials verified successfully.
 
     JobSubmissionRequest:
       type: object
       required:
         - prompt
-        - target_models
       properties:
         suite_id:
           type: string
+          maxLength: 128
           example: regression-suite-v1
         prompt:
           type: string
+          maxLength: 32000
           example: "Synthesize a robust Go concurrent worker pool with semaphore rate limiting."
         ground_truth:
           type: string
+          maxLength: 32000
+          description: Reference answer. Required for results to be graded and count toward the regression gate.
           example: "package main\n\ntype Pool struct..."
         target_models:
           type: array
+          description: Up to 12 model IDs; blanks and duplicates are removed. Defaults to the four models in the example when empty or omitted.
+          maxItems: 12
           items:
             type: string
+            maxLength: 100
           example: ["gemini-1.5-flash", "gpt-4o-mini", "claude-3-5-sonnet", "ollama:llama3"]
         max_tokens:
           type: integer
+          minimum: 1
+          maximum: 8192
           default: 512
+          description: 0 or omitted uses the default.
         budget_cap_usd:
           type: number
           default: 1.00
+          description: >
+            Per-job spend cap. 0 or omitted uses the default; must not exceed the server's
+            `BUDGET_CAP_USD` (default 10.0). Jobs whose worst-case cost exceeds it are rejected.
+        api_keys:
+          type: object
+          maxProperties: 20
+          description: >
+            BYOK credentials keyed by provider family (`gemini`, `openai`, `anthropic`). An
+            entry keyed by an exact model ID takes precedence over the family entry.
+            `ollama_endpoint` sets the Ollama base URL (absolute http(s) URL). Keys are never
+            stored in job records; in distributed mode the stream message carrying them is
+            deleted once processed.
+          additionalProperties:
+            type: string
+          example:
+            openai: sk-proj-...
+            ollama_endpoint: http://localhost:11434
 
     JobAcceptedResponse:
       type: object
@@ -246,55 +404,67 @@ components:
           format: uuid
         status:
           type: string
+          enum: [queued]
           example: queued
+        execution_mode:
+          type: string
+          enum: [stream, local]
+          description: '`stream` when enqueued to Redis for workers; `local` when executed in-process by the API.'
+          example: stream
         queued_at:
           type: string
           format: date-time
-        estimated_cost_usd:
-          type: number
-          example: 0.0034
-
-    EvalJobSummary:
-      type: object
-      properties:
-        job_id:
-          type: string
-          format: uuid
-        status:
-          type: string
-          example: completed
-        prompt_preview:
-          type: string
-          example: "Synthesize a robust Go concurrent..."
         target_models:
           type: array
+          description: Normalized list of models that will be evaluated.
           items:
             type: string
-        created_at:
-          type: string
-          format: date-time
-        winning_model:
-          type: string
-          example: "gemini-1.5-flash"
-        total_cost_usd:
+          example: ["gemini-1.5-flash", "gpt-4o-mini"]
+        estimated_cost_usd:
           type: number
-          example: 0.0028
+          description: Worst-case cost, assuming every model produces `max_tokens` of output.
+          example: 0.0034
 
-    EvalJobDetail:
+    EvalJob:
       type: object
       properties:
         job_id:
           type: string
-          format: uuid
+          example: 4382d27b-6f3e-4c1a-9f0e-2b7d1a9c8e11
+        suite_id:
+          type: string
+          example: regression-suite-v1
         status:
           type: string
+          enum: [queued, running, completed, failed]
+          description: '`failed` means every target model call failed.'
           example: completed
         prompt:
           type: string
         ground_truth:
           type: string
+        target_models:
+          type: array
+          items:
+            type: string
+        winning_model:
+          type: string
+          description: Successful result with the highest semantic score, ties broken by lower latency. Omitted when no model succeeded or the job is still pending.
+          example: gemini-1.5-flash
+        total_cost_usd:
+          type: number
+          description: Sum of successful results' cost.
+          example: 0.0028
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          description: Omitted until the job finishes.
         results:
           type: array
+          description: One entry per target model, in `target_models` order. Empty while queued or running.
           items:
             $ref: '#/components/schemas/ModelResult'
 
@@ -324,12 +494,30 @@ components:
         exact_match:
           type: boolean
           example: false
+        graded:
+          type: boolean
+          description: True when the job had a ground truth and the response came from a real provider. Only graded results affect the regression gate.
+          example: true
+        simulated:
+          type: boolean
+          description: True when no API key was available and the offline mock provider produced the response. Omitted when false.
+          example: false
         semantic_score:
           type: number
+          description: Cosine similarity to the ground truth, or a heuristic score when ungraded.
           example: 0.942
         regression_alert:
           type: boolean
+          description: Always false for ungraded results.
           example: false
+        drift_percent:
+          type: number
+          description: Drift from the 0.92 baseline score. 0 for ungraded results.
+          example: 0.0
+        error_message:
+          type: string
+          description: Present only when the model call failed; other metric fields are then zero.
+          example: 'anthropic returned HTTP 529: {"type":"error","error":{"type":"overloaded_error"}}'
 
     ModelComparisonMetric:
       type: object
@@ -339,7 +527,14 @@ components:
           example: gpt-4o-mini
         total_evals:
           type: integer
+          description: All results for the model, including failures.
           example: 142
+        failed_evals:
+          type: integer
+          example: 3
+        graded_evals:
+          type: integer
+          example: 57
         p50_latency_ms:
           type: integer
           example: 480
@@ -351,13 +546,19 @@ components:
           example: 1320
         avg_semantic_score:
           type: number
+          description: Mean score across all successful results (graded and ungraded).
           example: 0.925
+        avg_graded_score:
+          type: number
+          description: Mean score across graded results only; 0 when `graded_evals` is 0.
+          example: 0.931
         total_cost_usd:
           type: number
           example: 0.3421
         regression_status:
           type: string
-          enum: [stable, degraded, critical]
+          enum: [stable, degraded, critical, ungraded]
+          description: 'Derived from `avg_graded_score`: stable ≥ 0.85, degraded < 0.85, critical < 0.70; `ungraded` when there are no graded results.'
           example: stable
 
     RegressionCheckResult:
@@ -368,10 +569,18 @@ components:
           example: true
         exit_code:
           type: integer
+          enum: [0, 1]
           example: 0
         threshold_percent:
           type: number
           example: 5.0
+        baseline_score:
+          type: number
+          example: 0.92
+        graded_models:
+          type: integer
+          description: Number of models with at least one graded result.
+          example: 4
         max_observed_drift_percent:
           type: number
           example: 1.8
@@ -382,14 +591,16 @@ components:
           example: []
         message:
           type: string
-          example: "All models meet baseline standards. No regression detected."
+          example: "All graded models meet baseline standards. No regression detected."
+        timestamp:
+          type: string
+          format: date-time
 
     ErrorResponse:
       type: object
+      required:
+        - error
       properties:
         error:
           type: string
-          example: "Invalid model provider specified"
-        code:
-          type: string
-          example: "ERR_BAD_REQUEST"
+          example: "Field 'prompt' is required"
