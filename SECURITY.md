@@ -3,9 +3,12 @@
 ## 1. Zero-Exfiltration Security Philosophy
 
 EvalPulse is architected from the ground up for zero-trust data privacy and zero API key exfiltration:
-- **Client-Side Credential Retention:** API keys and provider access tokens (Gemini, Claude, OpenAI, OpenRouter) inputted in the UI are retained exclusively within browser local storage and ephemeral container memory during active benchmark runs.
+- **Credential Lifecycle:** API keys (Gemini, Claude, OpenAI) entered in the UI are stored in the browser's local storage and sent only to your own EvalPulse API, and only the keys needed by the models selected for a run. In distributed mode, keys travel inside the job message on the Redis stream; the worker deletes the message (`XDEL`) as soon as the job is acknowledged. Keys are never written to job records, results, or the metrics store.
+- **Dead-Letter Redaction:** Messages moved to the dead-letter stream have credentials stripped; unparseable payloads are dropped rather than copied.
+- **No Keys in URLs or Errors:** Gemini keys are sent in the `x-goog-api-key` header rather than the query string, and transport errors are stripped of request URLs, so keys cannot surface in logs or stored error messages.
 - **Zero Cloud Intermediaries:** Outbound HTTP requests to model providers are made directly from the user's workstation or private container runtime. No evaluation payloads or credentials pass through any external hosted EvalPulse infrastructure.
-- **Zero Plaintext Logging:** Sensitive headers (`x-api-key`, `Authorization: Bearer ...`) are redacted before job events are pushed to Redis Streams or log sinks.
+- **No Request-Body Logging:** The API logs method, path, status and duration only. Request bodies, which carry credentials, are never logged.
+- **Input Limits:** Request bodies are capped at 1 MiB; prompt size, model count, `max_tokens`, and per-job budget are validated server-side, and user-supplied endpoints must be absolute `http(s)` URLs.
 
 ---
 

@@ -26,6 +26,12 @@ services:
       - STREAM_KEY=eval:jobs
       - GROUP_NAME=eval-workers
       - BUDGET_CAP_USD=10.0
+      - SEED_DEMO_DATA=true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     depends_on:
       redis:
         condition: service_healthy
@@ -35,14 +41,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
-    container_name: evalpulse-worker
+    # No container_name / CONSUMER_NAME: each replica needs a unique consumer
+    # identity, which defaults to the container hostname.
     environment:
       - REDIS_URL=redis:6379
       - STREAM_KEY=eval:jobs
       - DLQ_STREAM_KEY=eval:dlq
       - GROUP_NAME=eval-workers
-      - CONSUMER_NAME=worker-node-alpha
       - WORKER_CONCURRENCY=25
+    stop_grace_period: 40s
     depends_on:
       redis:
         condition: service_healthy
@@ -58,7 +65,8 @@ services:
     ports:
       - "5173:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

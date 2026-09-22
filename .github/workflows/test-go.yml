@@ -10,16 +10,6 @@ jobs:
   test:
     name: Unit Tests & Race Detection
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7.2-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 2s
-          --health-retries 5
 
     steps:
       - name: Checkout Code
@@ -30,16 +20,32 @@ jobs:
         with:
           go-version: '1.22'
           check-latest: true
+          cache-dependency-path: go.sum
 
-      - name: Download & Verify Dependencies
+      # go.sum is authoritative: verify module hashes instead of regenerating
+      # the file, and fail if go.mod/go.sum are not tidy.
+      - name: Verify Dependencies
         run: |
-          rm -f go.sum
+          go mod download
+          go mod verify
           go mod tidy
-          git diff --exit-code go.mod
+          git diff --exit-code go.mod go.sum
 
-      - name: Run Unit Tests with Race Detector
+      - name: Check Formatting
         run: |
-          go test -v -race -coverprofile=coverage.out ./...
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # Redis-dependent tests use an in-process miniredis, so no service container is needed.
+      - name: Run Unit Tests with Race Detector
+        run: go test -race -coverprofile=coverage.out ./...
 
       - name: Upload Coverage Report
         uses: actions/upload-artifact@v4

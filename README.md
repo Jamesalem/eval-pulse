@@ -129,18 +129,23 @@ eval-pulse/
 │       └── openapi.yaml
 ├── cmd/
 │   ├── api/
-│   │   └── main.go          # High-throughput HTTP REST API Gateway
+│   │   ├── main.go          # Wiring, graceful shutdown, demo seeding
+│   │   ├── handlers.go      # REST handlers, request validation, budget enforcement
+│   │   └── middleware.go    # Panic recovery, request logging, security headers, CORS
 │   └── worker/
-│       └── main.go          # Distributed Redis Stream consumer & worker engine
+│       └── main.go          # Redis Stream consumer, crash reclaim, graceful drain
 ├── internal/
 │   ├── config/              # Environment variable configurations
 │   ├── eval/                # Scoring heuristics (Exact match, Cosine similarity, FinOps ledger)
 │   ├── models/              # Multi-provider adapters (Gemini, OpenAI, Anthropic, Ollama, Mock)
-│   ├── queue/               # Redis Stream producer & consumer group wrapper
-│   └── storage/             # Redis / In-memory persistent metric store
+│   ├── queue/               # Redis Stream producer, consumer group & redacted DLQ
+│   ├── runner/              # Shared parallel fan-out executor used by API and worker
+│   └── storage/             # Redis-backed job store shared by API & worker (in-memory fallback)
 ├── web/                     # React + Vite + Tailwind CSS metrics dashboard
 │   ├── src/
-│   │   ├── components/      # FinOps Bar, Latency Chart, Comparison Cards, BYOK Modal
+│   │   ├── components/      # Dashboard panels, accessible modals, error boundaries, toasts
+│   │   ├── hooks/           # useDashboardData: polling with abort, backoff & tab-visibility pause
+│   │   ├── lib/             # API client, safe localStorage, formatting helpers
 │   │   ├── App.jsx          # Real-time state coordination
 │   │   └── index.css
 │   ├── package.json
@@ -189,6 +194,25 @@ npm install
 npm run dev
 ```
 
+Without Redis the API runs **standalone**: jobs execute in-process and are kept in memory. With Redis, the API enqueues to the stream and both processes share job state through Redis. If the API runs on a port other than 8080, point the dev proxy at it with `API_PROXY_TARGET=http://localhost:<port> npm run dev`.
+
+### Configuration
+
+| Variable | Default | Used by | Description |
+| :--- | :--- | :--- | :--- |
+| `PORT` | `8080` | API | HTTP listen port |
+| `REDIS_URL` / `REDIS_PASSWORD` | `localhost:6379` / empty | API, worker | Redis address and password |
+| `STREAM_KEY` / `DLQ_STREAM_KEY` / `GROUP_NAME` | `eval:jobs` / `eval:dlq` / `eval-workers` | API, worker | Stream, dead-letter stream and consumer group |
+| `CONSUMER_NAME` | hostname | worker | Must be unique per worker replica |
+| `WORKER_CONCURRENCY` | `25` | worker | Max jobs processed concurrently per node |
+| `DEFAULT_TIMEOUT_SEC` | `30` | API, worker | Per-model call timeout |
+| `RECLAIM_IDLE_SEC` | `300` (min 2× timeout) | worker | Idle time before an unacknowledged job is reclaimed from a crashed worker |
+| `BUDGET_CAP_USD` | `10.0` | API | Maximum `budget_cap_usd` a single job may request |
+| `CORS_ALLOWED_ORIGINS` | `*` | API | Comma-separated allowed origins |
+| `SEED_DEMO_DATA` | `true` | API | Seed simulated demo runs into an empty store |
+
+Models without a configured API key run against an offline **simulated** provider. Simulated responses are labelled in the UI and are never graded, so they cannot trip the regression gate.
+
 ---
 
 ## 6. CI/CD Automated Regression Quality Gate
@@ -211,7 +235,9 @@ curl -f "http://localhost:8080/api/v1/metrics/regression-check?threshold_percent
 }
 ```
 
-If a candidate model degrades by more than 5.0%, the endpoint returns `HTTP 409 Conflict` with `exit_code: 1`, immediately halting the deployment pipeline.
+If a candidate model degrades by more than 5.0% against the 0.92 baseline score, the endpoint returns `HTTP 409 Conflict` with `exit_code: 1`, immediately halting the deployment pipeline. Only **graded** results count: runs submitted with a `ground_truth` and answered by a real provider. Exploratory runs and simulated responses are excluded.
+
+Jobs are also rejected up front (`HTTP 400`) when their worst-case cost (every model producing `max_tokens` of output) exceeds `budget_cap_usd`.
 
 ---
 

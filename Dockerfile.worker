@@ -6,7 +6,7 @@ WORKDIR /app
 RUN apk add --no-cache git ca-certificates
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download && go mod verify
 
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
@@ -16,9 +16,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /evalpulse-worker ./cm
 # Final minimal runtime image
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -S evalpulse && adduser -S -G evalpulse evalpulse
 
 WORKDIR /app
 COPY --from=builder /evalpulse-worker /app/evalpulse-worker
+
+USER evalpulse
 
 ENTRYPOINT ["/app/evalpulse-worker"]
