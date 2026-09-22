@@ -2,7 +2,7 @@ github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UF
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDTh3BQx604gYchL59iR44/grg=
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/rVNCu3HqELle0EqSXITzCd8tw3QCr5MEElg=
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTYrK0thu805CD8PVXiG68Co45Ot57Dewew=
-github.com/google/uuid v1.6.0 h1:NIvaJDKgjl6+/n9OXWdBt55QUgrhxV0IrX/cLxdupYo=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYLCitVTmxVEFV/mkPfKcFnaY9Qmfo8=
 github.com/redis/go-redis/v9 v9.6.1 h1:1R9i8Wl8c9q5bNsm/Yw5g09k8/V8zM8QeZg4h59R7W8=
 github.com/redis/go-redis/v9 v9.6.1/go.mod h1:t8c0u6Yv9Qp1fC6t9n6Kq3vR5/1R9i8Wl8c9q5bNsm/Y=
