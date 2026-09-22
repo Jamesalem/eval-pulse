@@ -1,222 +1,255 @@
 import React, { useState } from 'react';
-import { X, Play, Loader2, Sparkles, AlertCircle } from 'lucide-react';
+import { Play, Loader2, AlertCircle, Check, KeyRound, FlaskConical } from 'lucide-react';
+import Modal from './Modal';
+import { useToast } from './Toast';
+import { apiFetch } from '../lib/api';
+import { cn, providerFamily } from '../lib/format';
 
-export default function RunBenchmarkModal({ isOpen, onClose, onJobSubmitted, activeKeys }) {
-  if (!isOpen) return null;
+const AVAILABLE_MODELS = [
+  { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash', note: 'Fast · low cost' },
+  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', note: 'Deep reasoning' },
+  { id: 'gpt-4o-mini', name: 'GPT-4o-mini', note: 'OpenAI' },
+  { id: 'gpt-4o', name: 'GPT-4o', note: 'OpenAI' },
+  { id: 'claude-3-5-sonnet', name: 'Claude 3.5 Sonnet', note: 'Anthropic' },
+  { id: 'ollama:llama3', name: 'Llama 3 (Ollama)', note: 'Local · free' },
+];
 
+const MAX_OUTPUT_TOKENS = 8192;
+const MAX_PROMPT_CHARS = 32000;
+
+function hasCredential(modelId, keys) {
+  const family = providerFamily(modelId);
+  if (family === 'ollama') return true; // local daemon needs no key
+  return Boolean(keys?.[family]?.trim());
+}
+
+export default function RunBenchmarkModal({ onClose, onJobSubmitted, activeKeys, onOpenBYOK }) {
+  const { notify } = useToast();
   const [prompt, setPrompt] = useState('Implement a concurrent worker pool in Go with bounded channels and graceful context teardown.');
   const [groundTruth, setGroundTruth] = useState('package main\n\ntype WorkerPool struct {\n\tsem chan struct{}\n}');
   const [suiteID, setSuiteID] = useState('regression-suite-v1');
-  const [selectedModels, setSelectedModels] = useState([
-    'gemini-1.5-flash',
-    'gpt-4o-mini',
-    'claude-3-5-sonnet',
-    'ollama:llama3',
-  ]);
-  const [maxTokens, setMaxTokens] = useState(256);
-  const [budgetCap, setBudgetCap] = useState(1.0);
+  const [selectedModels, setSelectedModels] = useState(['gemini-1.5-flash', 'gpt-4o-mini', 'claude-3-5-sonnet', 'ollama:llama3']);
+  const [maxTokens, setMaxTokens] = useState('256');
+  const [budgetCap, setBudgetCap] = useState('1.00');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+  const [touched, setTouched] = useState(false);
 
-  const allAvailableModels = [
-    { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (Ultra Fast / Low Cost)' },
-    { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (Deep Reasoning)' },
-    { id: 'gpt-4o-mini', name: 'OpenAI GPT-4o-mini' },
-    { id: 'gpt-4o', name: 'OpenAI GPT-4o' },
-    { id: 'claude-3-5-sonnet', name: 'Anthropic Claude 3.5 Sonnet' },
-    { id: 'ollama:llama3', name: 'Local Ollama (Llama 3 - Free)' },
-  ];
+  const tokens = Number(maxTokens);
+  const budget = Number(budgetCap);
+  const errors = {
+    prompt: !prompt.trim() ? 'A prompt is required.' : prompt.length > MAX_PROMPT_CHARS ? `Keep the prompt under ${MAX_PROMPT_CHARS.toLocaleString()} characters.` : '',
+    models: selectedModels.length === 0 ? 'Select at least one model.' : '',
+    maxTokens: !Number.isInteger(tokens) || tokens < 1 || tokens > MAX_OUTPUT_TOKENS ? `Enter a whole number from 1 to ${MAX_OUTPUT_TOKENS}.` : '',
+    budget: !Number.isFinite(budget) || budget <= 0 ? 'Enter a budget greater than $0.' : '',
+  };
+  const isValid = !Object.values(errors).some(Boolean);
+  const simulatedModels = selectedModels.filter(m => !hasCredential(m, activeKeys));
 
-  const toggleModel = (id) => {
-    if (selectedModels.includes(id)) {
-      if (selectedModels.length > 1) {
-        setSelectedModels(selectedModels.filter(m => m !== id));
-      }
-    } else {
-      setSelectedModels([...selectedModels, id]);
-    }
+  const toggleModel = id => {
+    setSelectedModels(prev => (prev.includes(id) ? prev.filter(m => m !== id) : [...prev, id]));
   };
 
-  const handleSubmit = async (e) => {
+  const handleSubmit = async e => {
     e.preventDefault();
+    setTouched(true);
+    if (!isValid || submitting) return;
+
     setSubmitting(true);
     setErrorMsg('');
-
     try {
-      const res = await fetch('/api/v1/eval/jobs', {
+      // Only send the credentials the selected models actually need.
+      const neededFamilies = new Set(selectedModels.map(providerFamily));
+      const apiKeys = Object.fromEntries(
+        Object.entries(activeKeys || {}).filter(([k]) => neededFamilies.has(k) || (k === 'ollama_endpoint' && neededFamilies.has('ollama')))
+      );
+
+      const data = await apiFetch('/api/v1/eval/jobs', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          suite_id: suiteID,
+        body: {
+          suite_id: suiteID.trim(),
           prompt,
           ground_truth: groundTruth,
           target_models: selectedModels,
-          max_tokens: Number(maxTokens),
-          budget_cap_usd: Number(budgetCap),
-          api_keys: activeKeys,
-        }),
+          max_tokens: tokens,
+          budget_cap_usd: budget,
+          api_keys: apiKeys,
+        },
       });
-
-      const data = await res.json();
-      if (res.ok) {
-        onJobSubmitted(data.job_id);
-        onClose();
-      } else {
-        setErrorMsg(data.error || 'Failed to submit evaluation job');
-      }
+      notify({
+        tone: 'success',
+        title: 'Benchmark dispatched',
+        message: `${selectedModels.length} model${selectedModels.length === 1 ? '' : 's'} · worst-case cost $${Number(data?.estimated_cost_usd || 0).toFixed(4)}`,
+      });
+      onJobSubmitted?.(data?.job_id);
+      onClose();
     } catch (err) {
-      setErrorMsg('Failed to reach EvalPulse API gateway');
+      setErrorMsg(err.message || 'Failed to submit evaluation job.');
     } finally {
       setSubmitting(false);
     }
   };
 
+  const showError = field => touched && errors[field];
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
-        
-        {/* Header */}
-        <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-850">
-          <div>
-            <h3 className="text-base font-semibold text-white">Dispatch Distributed Benchmark Suite</h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Enqueues evaluation tasks to Redis Stream with Cline-style BYOK execution
-            </p>
-          </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800">
-            <X className="h-5 w-5" />
-          </button>
-        </div>
-
-        {/* Form Content */}
-        <form onSubmit={handleSubmit} className="px-6 py-4 overflow-y-auto space-y-4 flex-1">
-          {errorMsg && (
-            <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 flex items-center space-x-2 text-xs text-rose-300">
-              <AlertCircle className="h-4 w-4 text-rose-400 flex-shrink-0" />
-              <span>{errorMsg}</span>
-            </div>
-          )}
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              Benchmark Suite Identifier
-            </label>
-            <input
-              type="text"
-              value={suiteID}
-              onChange={e => setSuiteID(e.target.value)}
-              className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 font-mono"
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              Evaluation Prompt
-            </label>
-            <textarea
-              rows={3}
-              value={prompt}
-              onChange={e => setPrompt(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500"
-              placeholder="Enter benchmark prompt..."
-              required
-            />
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-1">
-              Ground Truth / Reference Schema (Optional)
-            </label>
-            <textarea
-              rows={2}
-              value={groundTruth}
-              onChange={e => setGroundTruth(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500 font-mono text-[11px]"
-              placeholder="Reference answer for Exact Match and Cosine scoring..."
-            />
-          </div>
-
-          {/* Model Target Selection */}
-          <div>
-            <label className="block text-xs font-semibold text-slate-300 mb-2">
-              Target Models (Parallel Fan-Out)
-            </label>
-            <div className="space-y-1.5">
-              {allAvailableModels.map(m => {
-                const isSelected = selectedModels.includes(m.id);
-                return (
-                  <button
-                    type="button"
-                    key={m.id}
-                    onClick={() => toggleModel(m.id)}
-                    className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs border transition-colors ${
-                      isSelected
-                        ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-200'
-                        : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700'
-                    }`}
-                  >
-                    <span className="font-mono">{m.name}</span>
-                    <span className={`h-4 w-4 rounded border flex items-center justify-center text-[10px] ${isSelected ? 'border-emerald-400 bg-emerald-500 text-slate-950 font-bold' : 'border-slate-700'}`}>
-                      {isSelected ? '✓' : ''}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Budget & Max Tokens */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-semibold text-slate-300 mb-1">
-                Max Output Tokens
-              </label>
-              <input
-                type="number"
-                value={maxTokens}
-                onChange={e => setMaxTokens(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 font-mono"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-300 mb-1">
-                Budget Hard-Cap ($ USD)
-              </label>
-              <input
-                type="number"
-                step="0.1"
-                value={budgetCap}
-                onChange={e => setBudgetCap(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200 font-mono"
-              />
-            </div>
-          </div>
-        </form>
-
-        {/* Footer */}
-        <div className="px-6 py-3 border-t border-slate-800 bg-slate-850 flex items-center justify-end space-x-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 font-medium transition-colors"
-          >
+    <Modal
+      title="Run benchmark"
+      description="Fans the prompt out to every selected model in parallel and scores each response."
+      onClose={onClose}
+      footer={
+        <div className="flex items-center justify-end gap-2">
+          <button type="button" onClick={onClose} className="btn-ghost">
             Cancel
           </button>
-          <button
-            onClick={handleSubmit}
-            disabled={submitting}
-            className="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs text-white font-medium shadow-sm transition-colors flex items-center space-x-1.5 disabled:opacity-50"
-          >
-            {submitting ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Play className="h-3.5 w-3.5 fill-current" />
-            )}
-            <span>Dispatch to Stream</span>
+          <button type="submit" form="benchmark-form" disabled={submitting} className="btn-primary">
+            {submitting ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Play className="h-3.5 w-3.5 fill-current" aria-hidden="true" />}
+            {submitting ? 'Dispatching…' : 'Dispatch'}
           </button>
         </div>
+      }
+    >
+      <form id="benchmark-form" onSubmit={handleSubmit} noValidate className="space-y-4">
+        {errorMsg && (
+          <div role="alert" className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/30 flex items-start gap-2 text-xs text-rose-300">
+            <AlertCircle className="h-4 w-4 text-rose-400 flex-shrink-0" aria-hidden="true" />
+            <span className="break-words">{errorMsg}</span>
+          </div>
+        )}
 
-      </div>
-    </div>
+        <div>
+          <label htmlFor="bm-prompt" className="field-label">
+            Prompt
+          </label>
+          <textarea
+            id="bm-prompt"
+            data-autofocus
+            rows={3}
+            value={prompt}
+            onChange={e => setPrompt(e.target.value)}
+            className="input"
+            placeholder="Enter the benchmark prompt…"
+            aria-invalid={showError('prompt') ? true : undefined}
+            aria-describedby="bm-prompt-hint"
+          />
+          <p id="bm-prompt-hint" className={cn('field-hint', showError('prompt') && 'text-rose-400')}>
+            {showError('prompt') || `${prompt.length.toLocaleString()} characters`}
+          </p>
+        </div>
+
+        <div>
+          <label htmlFor="bm-truth" className="field-label">
+            Ground truth <span className="font-normal text-slate-500">(optional)</span>
+          </label>
+          <textarea
+            id="bm-truth"
+            rows={3}
+            value={groundTruth}
+            onChange={e => setGroundTruth(e.target.value)}
+            className="input font-mono text-[11px]"
+            placeholder="Reference answer used for exact-match and cosine scoring…"
+            aria-describedby="bm-truth-hint"
+          />
+          <p id="bm-truth-hint" className="field-hint">
+            With a ground truth, real (non-simulated) responses are graded and count toward the regression gate. Otherwise only a heuristic score is shown.
+          </p>
+        </div>
+
+        <fieldset>
+          <legend className="field-label">Target models</legend>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {AVAILABLE_MODELS.map(m => {
+              const isSelected = selectedModels.includes(m.id);
+              const keyed = hasCredential(m.id, activeKeys);
+              return (
+                <label
+                  key={m.id}
+                  className={cn(
+                    'flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs border cursor-pointer transition-colors',
+                    isSelected ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-100' : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:border-slate-700'
+                  )}
+                >
+                  <input type="checkbox" className="sr-only peer" checked={isSelected} onChange={() => toggleModel(m.id)} />
+                  <span
+                    aria-hidden="true"
+                    className={cn(
+                      'h-4 w-4 rounded border flex items-center justify-center flex-shrink-0 peer-focus-visible:ring-2 peer-focus-visible:ring-emerald-400',
+                      isSelected ? 'border-emerald-400 bg-emerald-500 text-slate-950' : 'border-slate-600'
+                    )}
+                  >
+                    {isSelected && <Check className="h-3 w-3" strokeWidth={3} />}
+                  </span>
+                  <span className="flex-1 min-w-0">
+                    <span className="block font-medium truncate">{m.name}</span>
+                    <span className="block text-[10px] text-slate-500">{m.note}</span>
+                  </span>
+                  {keyed ? (
+                    <KeyRound className="h-3.5 w-3.5 text-indigo-400 flex-shrink-0" aria-label="Uses your key" />
+                  ) : (
+                    <FlaskConical className="h-3.5 w-3.5 text-amber-400/80 flex-shrink-0" aria-label="Simulated (no key)" />
+                  )}
+                </label>
+              );
+            })}
+          </div>
+          {showError('models') && <p className="field-hint text-rose-400">{errors.models}</p>}
+          {simulatedModels.length > 0 && (
+            <p className="mt-2 text-[11px] text-amber-300/90 flex items-start gap-1.5">
+              <FlaskConical className="h-3.5 w-3.5 mt-px flex-shrink-0" aria-hidden="true" />
+              <span>
+                {simulatedModels.length} selected model{simulatedModels.length === 1 ? ' has' : 's have'} no key and will run in offline simulation.{' '}
+                <button type="button" onClick={onOpenBYOK} className="underline underline-offset-2 hover:text-amber-200">
+                  Add keys
+                </button>
+              </span>
+            </p>
+          )}
+        </fieldset>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div>
+            <label htmlFor="bm-suite" className="field-label">
+              Suite ID
+            </label>
+            <input id="bm-suite" type="text" value={suiteID} onChange={e => setSuiteID(e.target.value)} maxLength={128} className="input font-mono" />
+          </div>
+          <div>
+            <label htmlFor="bm-tokens" className="field-label">
+              Max output tokens
+            </label>
+            <input
+              id="bm-tokens"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={MAX_OUTPUT_TOKENS}
+              value={maxTokens}
+              onChange={e => setMaxTokens(e.target.value)}
+              aria-invalid={showError('maxTokens') ? true : undefined}
+              className="input font-mono"
+            />
+            {showError('maxTokens') && <p className="field-hint text-rose-400">{errors.maxTokens}</p>}
+          </div>
+          <div>
+            <label htmlFor="bm-budget" className="field-label">
+              Budget cap (USD)
+            </label>
+            <input
+              id="bm-budget"
+              type="number"
+              inputMode="decimal"
+              min={0.01}
+              step="0.1"
+              value={budgetCap}
+              onChange={e => setBudgetCap(e.target.value)}
+              aria-invalid={showError('budget') ? true : undefined}
+              className="input font-mono"
+            />
+            {showError('budget') && <p className="field-hint text-rose-400">{errors.budget}</p>}
+          </div>
+        </div>
+        <p className="field-hint -mt-2">The job is rejected before any tokens are spent if its worst-case cost exceeds the budget cap.</p>
+      </form>
+    </Modal>
   );
 }
