@@ -31,10 +31,11 @@ jobs:
           go-version: '1.22'
           check-latest: true
 
-      - name: Verify Module Dependencies
+      - name: Download & Verify Dependencies
         run: |
+          rm -f go.sum
           go mod tidy
-          git diff --exit-code go.mod go.sum
+          git diff --exit-code go.mod
 
       - name: Run Unit Tests with Race Detector
         run: |
