@@ -1,0 +1,65 @@
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: evalpulse-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: evalpulse-api
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - REDIS_URL=redis:6379
+      - STREAM_KEY=eval:jobs
+      - GROUP_NAME=eval-workers
+      - BUDGET_CAP_USD=10.0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: evalpulse-worker
+    environment:
+      - REDIS_URL=redis:6379
+      - STREAM_KEY=eval:jobs
+      - DLQ_STREAM_KEY=eval:dlq
+      - GROUP_NAME=eval-workers
+      - CONSUMER_NAME=worker-node-alpha
+      - WORKER_CONCURRENCY=25
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: evalpulse-web
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  redis-data:

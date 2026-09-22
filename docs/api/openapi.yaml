@@ -1,0 +1,395 @@
+openapi: 3.0.3
+info:
+  title: EvalPulse API
+  description: >
+    Distributed Multi-Model LLM Evaluation & Regression Pipeline REST API.
+    Provides endpoints for asynchronous benchmark dispatch, real-time metrics inspection,
+    Cline-style Bring-Your-Own-Account (BYOK) credential testing, and CI/CD regression gates.
+  version: 1.0.0
+  contact:
+    name: EvalPulse Engineering Team
+    url: https://github.com/evalpulse/eval-pulse
+servers:
+  - url: http://localhost:8080
+    description: Local Docker / Development Server
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness and Readiness Probe
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service is healthy and Redis connection is verified
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  redis:
+                    type: string
+                    example: connected
+                  version:
+                    type: string
+                    example: 1.0.0
+
+  /api/v1/providers/validate:
+    post:
+      summary: Validate Cline-style BYOK Provider Credentials
+      description: Tests direct connectivity and quota availability for a specified model provider using the user's API key.
+      operationId: validateProvider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderValidationRequest'
+      responses:
+        '200':
+          description: Credentials valid and quota verified
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  provider:
+                    type: string
+                    example: gemini
+                  valid:
+                    type: boolean
+                    example: true
+                  latency_ms:
+                    type: integer
+                    example: 124
+                  message:
+                    type: string
+                    example: Provider connection and model quota validated successfully.
+        '400':
+          description: Invalid key or authentication failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/eval/jobs:
+    post:
+      summary: Submit Asynchronous Multi-Model Evaluation Job
+      description: Enqueues a benchmark suite or prompt task onto the Redis Stream for distributed worker processing.
+      operationId: submitEvalJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobSubmissionRequest'
+      responses:
+        '202':
+          description: Job accepted and queued for worker execution
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobAcceptedResponse'
+        '400':
+          description: Invalid request schema
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '402':
+          description: Estimated token cost exceeds user budget hard-cap
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    get:
+      summary: List Recent Evaluation Jobs
+      operationId: listEvalJobs
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [queued, running, completed, failed]
+      responses:
+        '200':
+          description: Array of recent evaluation jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EvalJobSummary'
+
+  /api/v1/eval/jobs/{id}:
+    get:
+      summary: Get Job Status and Detailed Evaluation Results
+      operationId: getEvalJobById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Detailed evaluation results across all models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalJobDetail'
+        '404':
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/metrics/comparison:
+    get:
+      summary: Get Cross-Model Comparison Matrix
+      description: Returns aggregated latency percentiles, average semantic score, total token count, and spend across models.
+      operationId: getModelComparison
+      responses:
+        '200':
+          description: Comparison scorecard across configured providers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ModelComparisonMetric'
+
+  /api/v1/metrics/regression-check:
+    get:
+      summary: CI/CD Continuous Regression Quality Gate
+      description: Evaluates whether any candidate model has dropped below the baseline threshold (>5% semantic regression). Returns exit status.
+      operationId: checkRegressionGate
+      parameters:
+        - name: threshold_percent
+          in: query
+          schema:
+            type: number
+            default: 5.0
+      responses:
+        '200':
+          description: Regression check passed (all models meet baseline)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegressionCheckResult'
+        '409':
+          description: Regression detected (one or more models failed threshold)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegressionCheckResult'
+
+components:
+  schemas:
+    ProviderValidationRequest:
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          type: string
+          enum: [gemini, openai, anthropic, ollama, openrouter]
+          example: gemini
+        api_key:
+          type: string
+          example: AIzaSy...
+        endpoint_url:
+          type: string
+          example: http://localhost:11434
+
+    JobSubmissionRequest:
+      type: object
+      required:
+        - prompt
+        - target_models
+      properties:
+        suite_id:
+          type: string
+          example: regression-suite-v1
+        prompt:
+          type: string
+          example: "Synthesize a robust Go concurrent worker pool with semaphore rate limiting."
+        ground_truth:
+          type: string
+          example: "package main\n\ntype Pool struct..."
+        target_models:
+          type: array
+          items:
+            type: string
+          example: ["gemini-1.5-flash", "gpt-4o-mini", "claude-3-5-sonnet", "ollama:llama3"]
+        max_tokens:
+          type: integer
+          default: 512
+        budget_cap_usd:
+          type: number
+          default: 1.00
+
+    JobAcceptedResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          example: queued
+        queued_at:
+          type: string
+          format: date-time
+        estimated_cost_usd:
+          type: number
+          example: 0.0034
+
+    EvalJobSummary:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          example: completed
+        prompt_preview:
+          type: string
+          example: "Synthesize a robust Go concurrent..."
+        target_models:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        winning_model:
+          type: string
+          example: "gemini-1.5-flash"
+        total_cost_usd:
+          type: number
+          example: 0.0028
+
+    EvalJobDetail:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          example: completed
+        prompt:
+          type: string
+        ground_truth:
+          type: string
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelResult'
+
+    ModelResult:
+      type: object
+      properties:
+        model:
+          type: string
+          example: gemini-1.5-flash
+        response:
+          type: string
+        latency_ms:
+          type: integer
+          example: 412
+        ttft_ms:
+          type: integer
+          example: 120
+        prompt_tokens:
+          type: integer
+          example: 38
+        completion_tokens:
+          type: integer
+          example: 184
+        cost_usd:
+          type: number
+          example: 0.00018
+        exact_match:
+          type: boolean
+          example: false
+        semantic_score:
+          type: number
+          example: 0.942
+        regression_alert:
+          type: boolean
+          example: false
+
+    ModelComparisonMetric:
+      type: object
+      properties:
+        model:
+          type: string
+          example: gpt-4o-mini
+        total_evals:
+          type: integer
+          example: 142
+        p50_latency_ms:
+          type: integer
+          example: 480
+        p95_latency_ms:
+          type: integer
+          example: 890
+        p99_latency_ms:
+          type: integer
+          example: 1320
+        avg_semantic_score:
+          type: number
+          example: 0.925
+        total_cost_usd:
+          type: number
+          example: 0.3421
+        regression_status:
+          type: string
+          enum: [stable, degraded, critical]
+          example: stable
+
+    RegressionCheckResult:
+      type: object
+      properties:
+        passed:
+          type: boolean
+          example: true
+        exit_code:
+          type: integer
+          example: 0
+        threshold_percent:
+          type: number
+          example: 5.0
+        max_observed_drift_percent:
+          type: number
+          example: 1.8
+        failing_models:
+          type: array
+          items:
+            type: string
+          example: []
+        message:
+          type: string
+          example: "All models meet baseline standards. No regression detected."
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Invalid model provider specified"
+        code:
+          type: string
+          example: "ERR_BAD_REQUEST"
